@@ -1,0 +1,73 @@
+# ==========================================
+# ROOT .gitignore — IBDMS_FYP
+# Covers: Flutter (frontend) + Python (backend)
+# ==========================================
+
+# ── SECRETS & ENVIRONMENT ─────────────────
+.env
+.env.*
+!.env.example
+firebase-key.json
+*.keystore
+*.jks
+google-services.json
+GoogleService-Info.plist
+
+# ── PYTHON BACKEND ─────────────────────────
+ibdms_backend/venv/
+ibdms_backend/__pycache__/
+ibdms_backend/**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+*.sqlite3
+*.db
+
+# ── FLUTTER / DART FRONTEND ────────────────
+ibdms_frontend/.dart_tool/
+ibdms_frontend/build/
+ibdms_frontend/.flutter-plugins
+ibdms_frontend/.flutter-plugins-dependencies
+ibdms_frontend/.pub-cache/
+ibdms_frontend/.pub/
+ibdms_frontend/coverage/
+ibdms_frontend/**/doc/api/
+ibdms_frontend/app.*.symbols
+ibdms_frontend/app.*.map.json
+
+# Android build artifacts
+ibdms_frontend/android/.gradle/
+ibdms_frontend/android/app/debug/
+ibdms_frontend/android/app/profile/
+ibdms_frontend/android/app/release/
+ibdms_frontend/android/local.properties
+
+# iOS build artifacts
+ibdms_frontend/ios/Pods/
+ibdms_frontend/ios/.symlinks/
+ibdms_frontend/ios/Flutter/App.framework
+ibdms_frontend/ios/Flutter/Flutter.framework
+ibdms_frontend/ios/Flutter/Flutter.podspec
+ibdms_frontend/ios/Flutter/Generated.xcconfig
+ibdms_frontend/ios/Flutter/ephemeral/
+ibdms_frontend/ios/Flutter/app.flx
+ibdms_frontend/ios/Flutter/app.zip
+ibdms_frontend/ios/Flutter/.last_build_id
+ibdms_frontend/ios/ServiceDefinitions.json
+ibdms_frontend/ios/Runner/GeneratedPluginRegistrant.*
+
+# ── IDE / EDITOR ───────────────────────────
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── LOGS & OS ──────────────────────────────
+*.log
+*.class

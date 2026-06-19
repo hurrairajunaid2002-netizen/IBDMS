@@ -1,0 +1,53 @@
+name: ibdms_frontend
+description: "Intelligent Blood Donor Management System — Mobile Application"
+publish_to: 'none'
+version: 2.0.0+1
+
+environment:
+  sdk: ^3.12.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ── Networking ──────────────────────────────────────────────────────────────
+  http: ^1.2.0
+
+  # ── Location ────────────────────────────────────────────────────────────────
+  geolocator: ^11.0.0
+
+  # ── Map ─────────────────────────────────────────────────────────────────────
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+
+  # ── Storage ─────────────────────────────────────────────────────────────────
+  shared_preferences: ^2.3.2
+
+  # ── Firebase — required for Google Sign-In and FCM push notifications ───────
+  # Setup:
+  #   1. Create project at https://console.firebase.google.com
+  #   2. Add Android app (package: com.example.ibdms_frontend)
+  #   3. Download google-services.json → place in android/app/
+  #   4. Run: flutter pub get
+  firebase_core: ^3.6.0
+  firebase_auth: ^5.3.0
+  firebase_messaging: ^15.1.0
+  google_sign_in: ^6.2.1
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  uses-material-design: true
+
+# Keep ONLY this block at the very end of your file:
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/images/app_logo.png"
+  min_sdk_android: 21

@@ -27,6 +27,12 @@ class DonorEnrollSchema(BaseModel):
     gps_longitude: float = 67.0011
 
 
+class DonorLocationUpdateSchema(BaseModel):
+    """Live GPS ping — matching uses donor_profiles.gps_* (not phone cache)."""
+    gps_latitude: float
+    gps_longitude: float
+
+
 # ── GET /api/donor/profile ────────────────────────────────────────────────────
 
 @router.get("/profile")
@@ -93,6 +99,14 @@ def enroll_as_donor(
             "availability_status": existing.availability_status,
         }
 
+    from controllers.matching_engine import parse_coords
+
+    if parse_coords(payload.gps_latitude, payload.gps_longitude, current_user["user_id"], "donor") is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid donor GPS. Enable location permission and retry enrolment.",
+        )
+
     dob_parsed: date_type = date_type(2000, 1, 1)
     try:
         dob_parsed = datetime.strptime(payload.dob, "%Y-%m-%d").date()
@@ -118,6 +132,50 @@ def enroll_as_donor(
         "message": "Successfully enrolled as a donor volunteer.",
         "blood_group": profile.blood_group,
         "availability_status": profile.availability_status,
+    }
+
+
+# ── PUT /api/donor/location ───────────────────────────────────────────────────
+
+@router.put("/location")
+def update_donor_location(
+    payload: DonorLocationUpdateSchema,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Refresh donor GPS on the profile used by the matching engine.
+    Call this whenever the donor opens Active Alerts or toggles availability.
+    """
+    from controllers.matching_engine import _dbg
+
+    donor = (
+        db.query(DonorProfile)
+        .filter(DonorProfile.user_id == current_user["user_id"])
+        .first()
+    )
+    if not donor:
+        raise HTTPException(
+            status_code=404,
+            detail="No donor profile found. Enroll first via POST /api/donor/enroll.",
+        )
+
+    old_lat = float(donor.gps_latitude)
+    old_lon = float(donor.gps_longitude)
+    donor.gps_latitude = payload.gps_latitude
+    donor.gps_longitude = payload.gps_longitude
+    db.commit()
+
+    _dbg(
+        f"PUT /api/donor/location user_id={current_user['user_id']} "
+        f"({old_lat:.5f},{old_lon:.5f}) → "
+        f"({payload.gps_latitude:.5f},{payload.gps_longitude:.5f})"
+    )
+
+    return {
+        "message": "Donor location updated.",
+        "gps_latitude": float(donor.gps_latitude),
+        "gps_longitude": float(donor.gps_longitude),
     }
 
 

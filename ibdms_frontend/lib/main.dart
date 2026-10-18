@@ -1,10 +1,18 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'; // REQUIRED for kIsWeb flag
 import 'api_config.dart';
 import 'login_screen.dart';
+import 'landing_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await ApiConfig.initialize();
+
+  // Web client ID is declared in login_screen.dart and index.html.
+  // Do NOT create a second GoogleSignIn instance here — it causes
+  // google.accounts.id.initialize() to be called twice and the last
+  // (potentially wrong) client ID wins, producing invalid_client errors.
+
   runApp(const IBDMSApp());
 }
 
@@ -30,9 +38,6 @@ class IBDMSApp extends StatelessWidget {
           centerTitle: true,
         ),
         elevatedButtonTheme: ElevatedButtonThemeData(
-          // minimumSize: Size(0, 48) — zero min-width so buttons inside Rows
-          // don't get unconstrained-width crashes. Full-width buttons achieve
-          // their width from Column(crossAxisAlignment: stretch) parents.
           style: ElevatedButton.styleFrom(
             backgroundColor: const Color(0xFFB71C1C),
             foregroundColor: Colors.white,
@@ -48,7 +53,8 @@ class IBDMSApp extends StatelessWidget {
               const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
         ),
       ),
-      home: const LoginScreen(),
+      // Web → full marketing landing page; mobile → login screen (unchanged).
+      home: kIsWeb ? const LandingPage() : const LoginScreen(),
     );
   }
 }

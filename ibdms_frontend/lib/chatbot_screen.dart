@@ -9,7 +9,13 @@ import 'api_config.dart';
 /// — Quick-reply suggestion chips for common topics
 class ChatbotScreen extends StatefulWidget {
   final String token;
-  const ChatbotScreen({super.key, required this.token});
+  final bool embedInShell;
+
+  const ChatbotScreen({
+    super.key,
+    required this.token,
+    this.embedInShell = false,
+  });
 
   @override
   State<ChatbotScreen> createState() => _ChatbotScreenState();
@@ -280,37 +286,72 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFFF4F6F9),
-      appBar: AppBar(
-        title: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(6),
-              decoration: BoxDecoration(
-                color: Colors.white.withAlpha(40),
-                borderRadius: BorderRadius.circular(8),
+      appBar: widget.embedInShell
+          ? null
+          : AppBar(
+              title: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withAlpha(40),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Icon(Icons.smart_toy_outlined,
+                        size: 18, color: Colors.white),
+                  ),
+                  const SizedBox(width: 8),
+                  const Text('AI Health Assistant'),
+                ],
               ),
-              child: const Icon(Icons.smart_toy_outlined,
-                  size: 18, color: Colors.white),
+              actions: [
+                IconButton(
+                  tooltip: 'Reset conversation',
+                  icon: const Icon(Icons.refresh),
+                  onPressed: () => setState(() {
+                    _assessmentActive = false;
+                    _step = 0;
+                    _answers.clear();
+                    _showWelcome();
+                  }),
+                ),
+              ],
             ),
-            const SizedBox(width: 8),
-            const Text('AI Health Assistant'),
-          ],
-        ),
-        actions: [
-          IconButton(
-            tooltip: 'Reset conversation',
-            icon: const Icon(Icons.refresh),
-            onPressed: () => setState(() {
-              _assessmentActive = false;
-              _step = 0;
-              _answers.clear();
-              _showWelcome();
-            }),
-          ),
-        ],
-      ),
       body: Column(
         children: [
+          if (widget.embedInShell)
+            Container(
+              width: double.infinity,
+              color: const Color(0xFFB71C1C),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Row(
+                children: [
+                  const Icon(Icons.smart_toy_outlined,
+                      size: 18, color: Colors.white),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      'AI Health Assistant',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                        fontSize: 15,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Reset conversation',
+                    icon: const Icon(Icons.refresh, color: Colors.white),
+                    onPressed: () => setState(() {
+                      _assessmentActive = false;
+                      _step = 0;
+                      _answers.clear();
+                      _showWelcome();
+                    }),
+                  ),
+                ],
+              ),
+            ),
           // Assessment progress bar
           if (_assessmentActive) _buildProgressBar(),
 

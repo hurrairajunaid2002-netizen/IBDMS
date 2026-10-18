@@ -1,9 +1,11 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'api_config.dart';
 import 'home_hub.dart';
 import 'login_screen.dart';
+import 'web_app_shell.dart';
 
 /// Profile completion screen for Google Sign-In users.
 ///
@@ -85,15 +87,26 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
       if (res.statusCode == 200) {
         final data = json.decode(res.body) as Map<String, dynamic>;
         final newToken = data['access_token'] as String? ?? widget.token;
-        final role = data['role'] as String? ?? 'Donor';
+        final role = data['role'] as String? ?? 'Unassigned';
+        final needsRoleSelection =
+            data['needs_role_selection'] as bool? ?? role == 'Unassigned';
+
+        final destination = kIsWeb
+            ? WebAppShell(
+                token: newToken,
+                role: role,
+                userName: widget.userName,
+                needsRoleSelection: needsRoleSelection,
+              )
+            : HomeHub(
+                token: newToken,
+                role: role,
+                userName: widget.userName,
+                needsRoleSelection: needsRoleSelection,
+              );
+
         Navigator.of(context).pushReplacement(
-          MaterialPageRoute(
-            builder: (_) => HomeHub(
-              token: newToken,
-              role: role,
-              userName: widget.userName,
-            ),
-          ),
+          MaterialPageRoute(builder: (_) => destination),
         );
       } else {
         final data = json.decode(res.body) as Map<String, dynamic>;

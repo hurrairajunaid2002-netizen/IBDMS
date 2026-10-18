@@ -247,6 +247,39 @@ def send_forgot_password_email(to: str, user_name: str, otp: str) -> None:
     send_email(to, subject, _email_shell("Password reset code", body), text_body=text)
 
 
+def notify_dual_match_found(
+    recipient_token: Optional[str],
+    donor_token: Optional[str],
+    distance_km: float,
+    blood_group: str,
+    match_id: int,
+    request_id: int,
+) -> None:
+    """Instant push to BOTH parties when a new match is identified."""
+    dist_label = f"{distance_km:.1f} km"
+    data = {
+        "type": "match_found",
+        "match_id": str(match_id),
+        "request_id": str(request_id),
+        "blood_group": blood_group,
+        "distance_km": str(distance_km),
+    }
+    if recipient_token:
+        send_fcm_push(
+            recipient_token,
+            "Matching donor found!",
+            f"We found a matching donor {dist_label} away!",
+            data={**data, "role": "recipient"},
+        )
+    if donor_token:
+        send_fcm_push(
+            donor_token,
+            "Urgent blood request nearby",
+            "Urgent! A patient nearby matches your blood type. View request.",
+            data={**data, "role": "donor"},
+        )
+
+
 def send_blood_request_alert(
     donor_emails: List[str],
     requester_name: str,
@@ -276,7 +309,100 @@ def send_blood_request_alert(
     )
     html = _email_shell("Blood donation request", body)
     for email in donor_emails:
-        send_email(email, subject, html, text_body=text)
+        if email and "@" in email:
+            send_email(email, subject, html, text_body=text)
+
+
+def send_donor_accept_confirmation_email(
+    to: str,
+    donor_name: str,
+    recipient_name: str,
+    blood_group: str,
+    request_lat: float,
+    request_lon: float,
+    request_id: int,
+) -> None:
+    """Donor-facing email after they accept a match — includes routing coordinates."""
+    safe_donor = html_escape(donor_name)
+    safe_recipient = html_escape(recipient_name)
+    safe_group = html_escape(blood_group)
+    subject = f"IBDMS — match confirmed ({blood_group})"
+    body = f"""
+      <p style="margin:0 0 12px;color:#333;">Hello {safe_donor},</p>
+      <p style="margin:0 0 12px;color:#333;">
+        Thank you for accepting the emergency blood request for group
+        <strong>{safe_group}</strong>.
+      </p>
+      <p style="margin:0 0 8px;color:#333;"><strong>Recipient:</strong> {safe_recipient}</p>
+      <p style="margin:0 0 8px;color:#333;"><strong>Request ID:</strong> #{request_id}</p>
+      <p style="margin:0 0 16px;color:#333;">
+        <strong>Meeting point:</strong>
+        {request_lat:.5f}, {request_lon:.5f}
+      </p>
+      <p style="margin:0;color:#B71C1C;font-weight:bold;">
+        Open the IBDMS app for turn-by-turn routing and live contact details.
+      </p>
+    """
+    text = (
+        f"Hello {donor_name},\n\n"
+        f"You accepted request #{request_id} for blood group {blood_group}.\n"
+        f"Recipient: {recipient_name}\n"
+        f"Coordinates: {request_lat:.5f}, {request_lon:.5f}\n\n"
+        "Open the IBDMS app for routing.\n"
+    )
+    send_email(to, subject, _email_shell("Match confirmed — thank you", body), text_body=text)
+
+
+def send_recipient_match_accepted_email(
+    to: str,
+    recipient_name: str,
+    donor_name: str,
+    donor_phone: str,
+    blood_group: str,
+    request_lat: float,
+    request_lon: float,
+    request_id: int,
+) -> None:
+    """Recipient-facing email when a donor accepts — contact + coordinates revealed."""
+    safe_recipient = html_escape(recipient_name)
+    safe_donor = html_escape(donor_name)
+    safe_phone = html_escape(donor_phone or "See IBDMS app")
+    safe_group = html_escape(blood_group)
+    subject = f"IBDMS — a donor accepted your {blood_group} request"
+    body = f"""
+      <p style="margin:0 0 12px;color:#333;">Hello {safe_recipient},</p>
+      <p style="margin:0 0 12px;color:#333;">
+        Good news — <strong>{safe_donor}</strong> has accepted your emergency
+        blood request for group <strong>{safe_group}</strong>.
+      </p>
+      <table role="presentation" cellspacing="0" cellpadding="0"
+             style="margin:16px 0;background:#FEF2F2;border-radius:8px;width:100%;">
+        <tr>
+          <td style="padding:16px;">
+            <p style="margin:0 0 6px;color:#333;"><strong>Donor contact:</strong> {safe_phone}</p>
+            <p style="margin:0 0 6px;color:#333;"><strong>Request ID:</strong> #{request_id}</p>
+            <p style="margin:0;color:#333;">
+              <strong>Your location:</strong> {request_lat:.5f}, {request_lon:.5f}
+            </p>
+          </td>
+        </tr>
+      </table>
+      <p style="margin:0;color:#333;">
+        Open IBDMS to coordinate pickup and view the donor on the map.
+      </p>
+    """
+    text = (
+        f"Hello {recipient_name},\n\n"
+        f"{donor_name} accepted your {blood_group} request #{request_id}.\n"
+        f"Donor phone: {donor_phone or 'See app'}\n"
+        f"Location: {request_lat:.5f}, {request_lon:.5f}\n"
+    )
+    send_email(
+        to,
+        subject,
+        _email_shell("Donor match accepted", body),
+        text_body=text,
+    )
 
 
 # ── FCM Push Notifications ────────────────────────────────────────────────────
@@ -327,8 +453,8 @@ def broadcast_blood_request_push(
         from firebase_admin import messaging
         message = messaging.MulticastMessage(
             notification=messaging.Notification(
-                title=f"🚨 Urgent: {blood_group} Blood Needed",
-                body=f"A patient near {location_hint} requires {blood_group} blood. Tap to respond.",
+                title=f"Urgent: {blood_group} blood needed nearby",
+                body=f"A patient within your alert radius needs {blood_group} blood. Tap to respond.",
             ),
             data={
                 "request_id": str(request_id),

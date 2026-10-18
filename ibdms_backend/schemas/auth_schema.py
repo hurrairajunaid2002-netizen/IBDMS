@@ -57,6 +57,11 @@ class GoogleSignInSchema(BaseModel):
     access_token: Optional[str] = None
 
 
+class GoogleWebSignInSchema(BaseModel):
+    """Web-only fallback: access_token from google_sign_in_web token-client flow."""
+    access_token: str
+
+
 class CompleteProfileSchema(BaseModel):
     """Sent after Google Sign-In when blood_group or phone_number is missing."""
     phone_number: str = Field(..., min_length=7, max_length=20)
@@ -94,6 +99,19 @@ class FcmTokenUpdateSchema(BaseModel):
     fcm_token: str
 
 
+class RoleSelectSchema(BaseModel):
+    """Explicit Donor vs Recipient onboarding choice."""
+    role: str = Field(..., description="Donor or Recipient")
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        allowed = {"Donor", "Recipient"}
+        if v not in allowed:
+            raise ValueError("Role must be Donor or Recipient.")
+        return v
+
+
 class UserLoginSchema(BaseModel):
     email: EmailStr
     password: str
@@ -106,3 +124,4 @@ class TokenResponseSchema(BaseModel):
     full_name: str
     blood_group: Optional[str] = None
     needs_profile: bool = False  # True when Google user has no phone/blood_group
+    needs_role_selection: bool = False  # True when role is still Unassigned

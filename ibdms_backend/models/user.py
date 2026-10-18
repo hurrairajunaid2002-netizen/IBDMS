@@ -9,7 +9,11 @@ class User(Base):
     full_name = Column(String(100), nullable=False)
     email = Column(String(100), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=True)  # nullable for Google-only accounts
-    role = Column(Enum("Donor", "Recipient", "Administrator"), nullable=False, default="Donor")
+    role = Column(
+        Enum("Donor", "Recipient", "Administrator", "Unassigned"),
+        nullable=False,
+        default="Unassigned",
+    )
     phone_number = Column(String(20), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
 

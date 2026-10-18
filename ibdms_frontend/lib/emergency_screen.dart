@@ -6,23 +6,29 @@ import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 import 'api_config.dart';
+import 'services/live_match_sync.dart';
+import 'services/match_contact_service.dart';
+import 'utils/map_location_service.dart';
+import 'widgets/my_location_fab.dart';
+import 'widgets/match_decision_card.dart';
+import 'widgets/match_found_overlay.dart';
 
 /// Emergency Blood Search — open to ALL authenticated users.
 ///
-/// Dual-Role capability: Recipients AND Donors can place blood requests.
-/// The backend's time-staged escalation engine handles radius expansion;
-/// this screen polls GET /api/requests/{id}/status every 15 s and drives
-/// a live countdown UI over the flutter_map.
+/// Live sync: polls GET /api/requests/{id}/live every 4 s while searching and
+/// shows instant pop-ups when new FOUND / ACCEPTED matches arrive.
 class EmergencyScreen extends StatefulWidget {
   final String token;
   final String userName;
   final String role;
+  final bool embedInShell;
 
   const EmergencyScreen({
     super.key,
     required this.token,
     required this.userName,
     required this.role,
+    this.embedInShell = false,
   });
 
   @override
@@ -30,7 +36,7 @@ class EmergencyScreen extends StatefulWidget {
 }
 
 class _EmergencyScreenState extends State<EmergencyScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   // ── Map ───────────────────────────────────────────────────────────────────
   final MapController _mapController = MapController();
   bool _mapReady = false;
@@ -57,11 +63,17 @@ class _EmergencyScreenState extends State<EmergencyScreen>
   double _nextRadiusKm = 10.0;
   int _matchedCount = 0;
   List<Map<String, dynamic>> _matchedDonors = [];
+  List<String> _compatibleDonorGroups = [];
+  bool _matchDecisionBusy = false;
+  final Map<int, Map<String, dynamic>> _authorizedByMatchId = {};
 
-  // ── Countdown (local, synced from backend every 15 s) ─────────────────────
-  int _secondsUntilExpansion = 300;
+  // ── Countdown (local, synced from backend every 4 s) ──────────────────────
+  static const int _stageDurationSeconds = 120;
+  int _secondsUntilExpansion = _stageDurationSeconds;
+  bool _awaitingExpansionRefresh = false;
   Timer? _countdownTimer;
-  Timer? _pollTimer;
+  final LiveMatchSync _liveSync = LiveMatchSync();
+  final GlobalKey _decisionSectionKey = GlobalKey();
 
   // ── Pulse animation ───────────────────────────────────────────────────────
   late AnimationController _pulseCtrl;
@@ -76,6 +88,7 @@ class _EmergencyScreenState extends State<EmergencyScreen>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _pulseCtrl = AnimationController(
         vsync: this, duration: const Duration(milliseconds: 1100));
     _pulseAlpha =
@@ -84,10 +97,18 @@ class _EmergencyScreenState extends State<EmergencyScreen>
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _isSearching) {
+      _fetchLive();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pulseCtrl.dispose();
     _countdownTimer?.cancel();
-    _pollTimer?.cancel();
+    _liveSync.stopPolling();
     _mapController.dispose();
     super.dispose();
   }
@@ -128,14 +149,20 @@ class _EmergencyScreenState extends State<EmergencyScreen>
     }
   }
 
-  void _applyLocation(LatLng loc, {String? banner}) {
+  void _applyLocation(LatLng loc, {String? banner, bool animate = false}) {
     if (!mounted) return;
     setState(() {
       _deviceLocation = loc;
       _gpsLoading = false;
       _gpsError = banner ?? '';
     });
-    if (_mapReady) _mapController.move(loc, 12.0);
+    if (_mapReady) {
+      if (animate) {
+        MapLocationService.animateMapTo(_mapController, target: loc, zoom: 14);
+      } else {
+        _mapController.move(loc, 12.0);
+      }
+    }
   }
 
   Future<void> _refineGps() async {
@@ -144,8 +171,11 @@ class _EmergencyScreenState extends State<EmergencyScreen>
               desiredAccuracy: LocationAccuracy.high)
           .timeout(const Duration(seconds: 10));
       if (mounted) {
-        setState(() => _deviceLocation = LatLng(pos.latitude, pos.longitude));
-        if (_mapReady) _mapController.move(_deviceLocation!, 14.0);
+        final loc = LatLng(pos.latitude, pos.longitude);
+        setState(() => _deviceLocation = loc);
+        if (_mapReady) {
+          MapLocationService.animateMapTo(_mapController, target: loc, zoom: 14);
+        }
       }
     } catch (_) {}
   }
@@ -165,10 +195,12 @@ class _EmergencyScreenState extends State<EmergencyScreen>
       _activeRequestId = null;
       _currentRadiusKm = 5.0;
       _nextRadiusKm = 10.0;
-      _secondsUntilExpansion = 300;
+      _secondsUntilExpansion = _stageDurationSeconds;
+      _awaitingExpansionRefresh = false;
       _matchedCount = 0;
       _matchedDonors = [];
     });
+    _liveSync.reset();
     _pulseCtrl.repeat(reverse: true);
 
     try {
@@ -193,25 +225,18 @@ class _EmergencyScreenState extends State<EmergencyScreen>
 
       if (res.statusCode == 201) {
         final data = json.decode(res.body) as Map<String, dynamic>;
-        setState(() {
-          _activeRequestId = data['request_id'] as int;
-          _currentRadiusKm =
-              (data['current_radius_km'] as num).toDouble();
-          _nextRadiusKm = (data['next_radius_km'] as num).toDouble();
-          _secondsUntilExpansion =
-              (data['seconds_until_expansion'] as int? ?? 300);
-          _matchedCount = data['matched_count'] as int? ?? 0;
-          _matchedDonors =
-              (data['matched_donors'] as List? ?? [])
-                  .map((e) => Map<String, dynamic>.from(e as Map))
-                  .toList();
-          _searchStatus = data['status'] as String? ?? 'Pending';
-        });
+        await _applyLivePayload(data);
         _syncMapRadius();
 
         if (_searchStatus == 'Pending') {
           _startCountdown();
-          _startPolling();
+          final initialFound = _matchedDonors
+              .where((d) => d['status']?.toString() == 'FOUND')
+              .toList();
+          if (mounted && initialFound.isNotEmpty) {
+            await _triggerMatchPopups(initialFound);
+          }
+          _startLivePolling();
         } else {
           _endSearch(fromBackend: true);
         }
@@ -231,53 +256,256 @@ class _EmergencyScreenState extends State<EmergencyScreen>
       setState(() {
         if (_secondsUntilExpansion > 0) {
           _secondsUntilExpansion--;
-        } else {
-          // Timer expired — force a status poll now.
-          _fetchStatus();
+          _awaitingExpansionRefresh = false;
+        } else if (!_awaitingExpansionRefresh) {
+          _awaitingExpansionRefresh = true;
+          _fetchLive();
         }
       });
     });
   }
 
-  void _startPolling() {
-    _pollTimer?.cancel();
-    _pollTimer = Timer.periodic(const Duration(seconds: 15), (_) {
-      if (_isSearching) _fetchStatus();
+  void _startLivePolling() {
+    _liveSync.startWebSocket(
+      token: widget.token,
+      onWsMatch: (match) {
+        if (!mounted) return;
+        setState(() {
+          final id = match['match_id'];
+          if (id != null &&
+              !_matchedDonors.any((d) => d['match_id'] == id)) {
+            _matchedDonors = [..._matchedDonors, match];
+            _matchedCount = _matchedDonors.length;
+          }
+        });
+        unawaited(_triggerMatchPopups([match]));
+      },
+    );
+    _liveSync.startPolling(
+      isActive: () => mounted && _isSearching && _activeRequestId != null,
+      pollOnce: _fetchLive,
+    );
+  }
+
+  Future<void> _triggerMatchPopups(List<Map<String, dynamic>> events) async {
+    if (!mounted || events.isEmpty) return;
+    await _liveSync.processNewMatches(
+      context,
+      newEvents: events,
+      onConnect: _connectMatchFromPopup,
+      onKeepLooking: _continueSearchFromPopup,
+    );
+  }
+
+  Future<void> _connectMatchFromPopup(Map<String, dynamic> match) async {
+    await _connectMatch(match);
+    final matchId = match['match_id'] as int?;
+    if (matchId == null || !mounted) return;
+    final auth = _authorizedByMatchId[matchId];
+    if (auth != null) await _showContactUnlockedSheet(auth);
+  }
+
+  Future<void> _continueSearchFromPopup(Map<String, dynamic> match) async {
+    await _continueSearchMatch(match);
+  }
+
+  Future<void> _showContactUnlockedSheet(Map<String, dynamic> auth) async {
+    if (!mounted) return;
+    final phone = auth['phone']?.toString();
+    final lat = (auth['request_latitude'] as num?)?.toDouble();
+    final lon = (auth['request_longitude'] as num?)?.toDouble();
+
+    await showModalBottomSheet<void>(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Contact unlocked',
+              style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w800,
+                    color: Colors.green[800],
+                  ),
+            ),
+            const SizedBox(height: 12),
+            if (phone != null && phone.isNotEmpty)
+              ElevatedButton.icon(
+                onPressed: () => MatchContactService.dialPhone(phone),
+                icon: const Icon(Icons.phone),
+                label: Text('Call $phone'),
+              ),
+            if (lat != null && lon != null) ...[
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: () => MatchContactService.openMaps(
+                  latitude: lat,
+                  longitude: lon,
+                ),
+                icon: const Icon(Icons.directions),
+                label: const Text('Open in Maps'),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _applyLivePayload(Map<String, dynamic> data) async {
+    if (!mounted) return;
+    setState(() {
+      _activeRequestId = data['request_id'] as int? ?? _activeRequestId;
+      _currentRadiusKm =
+          (data['current_radius_km'] as num?)?.toDouble() ?? _currentRadiusKm;
+      _nextRadiusKm =
+          (data['next_radius_km'] as num?)?.toDouble() ?? _nextRadiusKm;
+      _secondsUntilExpansion = data['seconds_until_expansion'] as int? ??
+          _secondsUntilExpansion;
+      _awaitingExpansionRefresh = false;
+      _matchedCount = data['matched_count'] as int? ?? 0;
+      _matchedDonors = (data['matched_donors'] as List? ?? [])
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      _compatibleDonorGroups = (data['compatible_donor_groups'] as List? ?? [])
+          .map((e) => e.toString())
+          .toList();
+      _searchStatus = data['status'] as String? ?? _searchStatus;
     });
   }
 
-  Future<void> _fetchStatus() async {
+  List<Map<String, dynamic>> _parseNewMatchEvents(Map<String, dynamic> data) {
+    return (data['new_match_events'] as List? ?? [])
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+  }
+
+  Future<void> _fetchLive() async {
     if (_activeRequestId == null || !mounted) return;
     try {
+      final seen = _liveSync.seenMatchIds.join(',');
+      final uri = Uri.parse(
+        '${ApiConfig.baseUrl}/api/requests/$_activeRequestId/live'
+        '${seen.isNotEmpty ? '?seen_match_ids=$seen' : ''}',
+      );
       final res = await http.get(
-        Uri.parse(
-            '${ApiConfig.baseUrl}/api/requests/$_activeRequestId/status'),
+        uri,
         headers: {'Authorization': 'Bearer ${widget.token}'},
       ).timeout(const Duration(seconds: 10));
       if (!mounted) return;
       if (res.statusCode == 200) {
         final data = json.decode(res.body) as Map<String, dynamic>;
         final newStatus = data['status'] as String? ?? 'Pending';
-        setState(() {
-          _currentRadiusKm =
-              (data['current_radius_km'] as num).toDouble();
-          _nextRadiusKm = (data['next_radius_km'] as num).toDouble();
-          _secondsUntilExpansion =
-              data['seconds_until_expansion'] as int? ?? 0;
-          _matchedCount = data['matched_count'] as int? ?? 0;
-          _matchedDonors =
-              (data['matched_donors'] as List? ?? [])
-                  .map((e) => Map<String, dynamic>.from(e as Map))
-                  .toList();
-          _searchStatus = newStatus;
-        });
+        final newEvents = _parseNewMatchEvents(data);
+        await _applyLivePayload(data);
         _syncMapRadius();
+
+        if (newEvents.isNotEmpty && mounted) {
+          await _triggerMatchPopups(newEvents);
+        }
 
         if (newStatus != 'Pending') {
           _endSearch(fromBackend: true);
         }
       }
     } catch (_) {}
+  }
+
+  void _scrollToDecisionCard() {
+    final ctx = _decisionSectionKey.currentContext;
+    if (ctx != null) {
+      Scrollable.ensureVisible(
+        ctx,
+        duration: const Duration(milliseconds: 400),
+        curve: Curves.easeInOut,
+      );
+    }
+  }
+
+  Map<String, dynamic>? get _foundMatchForDecision {
+    for (final d in _matchedDonors) {
+      final status = d['status']?.toString() ?? '';
+      if (status == 'FOUND') return d;
+    }
+    return null;
+  }
+
+  void _applyMatchDecisionResult(
+    int matchId,
+    Map<String, dynamic> result,
+  ) {
+    final status = result['status']?.toString() ?? '';
+    final authorized = result['authorized'] as Map<String, dynamic>?;
+    setState(() {
+      _matchedDonors = _matchedDonors.map((d) {
+        if (d['match_id'] == matchId) {
+          return {...d, 'status': status};
+        }
+        return d;
+      }).toList();
+      if (authorized != null) {
+        _authorizedByMatchId[matchId] = authorized;
+      }
+    });
+  }
+
+  Future<void> _connectMatch(Map<String, dynamic> match) async {
+    final matchId = match['match_id'] as int?;
+    if (matchId == null || _matchDecisionBusy) return;
+    setState(() => _matchDecisionBusy = true);
+    try {
+      final result = await MatchDecisionCard.connect(
+        token: widget.token,
+        matchId: matchId,
+      );
+      if (!mounted) return;
+      if (result != null) {
+        _applyMatchDecisionResult(matchId, result);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Connected! Contact details unlocked.'),
+            ),
+          );
+          final auth = _authorizedByMatchId[matchId];
+          if (auth != null) await _showContactUnlockedSheet(auth);
+        }
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not connect. Try again.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _matchDecisionBusy = false);
+    }
+  }
+
+  Future<void> _continueSearchMatch(Map<String, dynamic> match) async {
+    final matchId = match['match_id'] as int?;
+    if (matchId == null || _matchDecisionBusy) return;
+    setState(() => _matchDecisionBusy = true);
+    try {
+      final result = await MatchDecisionCard.continueSearch(
+        token: widget.token,
+        matchId: matchId,
+      );
+      if (!mounted) return;
+      if (result != null) {
+        _applyMatchDecisionResult(matchId, result);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Donor saved as backup — search continues.'),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _matchDecisionBusy = false);
+    }
   }
 
   Future<void> _cancelSearch() async {
@@ -298,7 +526,8 @@ class _EmergencyScreenState extends State<EmergencyScreen>
 
   void _endSearch({required bool fromBackend}) {
     _countdownTimer?.cancel();
-    _pollTimer?.cancel();
+    _liveSync.stopPolling();
+    _liveSync.stopWebSocket();
     _pulseCtrl.stop();
     if (!mounted) return;
     setState(() {
@@ -317,15 +546,20 @@ class _EmergencyScreenState extends State<EmergencyScreen>
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  void _clearResults() => setState(() {
+  void _clearResults() {
+    _liveSync.reset();
+    setState(() {
         _searchComplete = false;
         _searchStatus = '';
         _matchedDonors = [];
         _matchedCount = 0;
+        _compatibleDonorGroups = [];
         _activeRequestId = null;
+        _authorizedByMatchId.clear();
         _currentRadiusKm = 5.0;
         _nextRadiusKm = 10.0;
       });
+  }
 
   void _syncMapRadius() {
     if (!_mapReady || _deviceLocation == null) return;
@@ -347,6 +581,11 @@ class _EmergencyScreenState extends State<EmergencyScreen>
         'Medium' => Colors.orange,
         _ => Colors.green,
       };
+
+  String get _compatibilitySearchLabel {
+    if (_compatibleDonorGroups.isEmpty) return '';
+    return 'Searching for compatible donors (${_compatibleDonorGroups.join(', ')})…';
+  }
 
   String get _countdownLabel {
     final m = _secondsUntilExpansion ~/ 60;
@@ -390,9 +629,11 @@ class _EmergencyScreenState extends State<EmergencyScreen>
             child: const Icon(Icons.person_pin, color: Colors.white, size: 18),
           ),
         ),
-        ..._matchedDonors.map((d) {
-          final lat = (d['latitude'] as num?)?.toDouble() ?? center.latitude;
-          final lon = (d['longitude'] as num?)?.toDouble() ?? center.longitude;
+        ..._matchedDonors
+            .where((d) => d['latitude'] != null && d['longitude'] != null)
+            .map((d) {
+          final lat = (d['latitude'] as num).toDouble();
+          final lon = (d['longitude'] as num).toDouble();
           return Marker(
             point: LatLng(lat, lon),
             width: 28,
@@ -414,18 +655,28 @@ class _EmergencyScreenState extends State<EmergencyScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Emergency Blood Search'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.info_outline),
-            tooltip: 'How it works',
-            onPressed: _showInfoDialog,
-          ),
-        ],
-      ),
+      appBar: widget.embedInShell
+          ? null
+          : AppBar(
+              title: const Text('Emergency Blood Search'),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.info_outline),
+                  tooltip: 'How it works',
+                  onPressed: _showInfoDialog,
+                ),
+              ],
+            ),
       body: Column(
         children: [
+          if (_isSearching && _foundMatchForDecision != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              child: MatchFoundBanner(
+                match: _foundMatchForDecision!,
+                onTap: _scrollToDecisionCard,
+              ),
+            ),
           _buildFilterBar(),
           Expanded(child: _buildMapBody()),
           if (_searchComplete) _buildResultPanel(),
@@ -440,7 +691,7 @@ class _EmergencyScreenState extends State<EmergencyScreen>
           title: const Text('How the Search Works'),
           content: const Text(
               '1. Starts scanning at 5 km from your GPS position.\n\n'
-              '2. If no compatible donors accept within 5 minutes, the '
+              '2. If no compatible donors accept within 2 minutes, the '
               'radius expands by +5 km (→ 10, 15, 20 … up to 50 km).\n\n'
               '3. The search stops as soon as enough donors are found, '
               'you press Cancel, or the 50 km ceiling is reached.\n\n'
@@ -690,6 +941,22 @@ class _EmergencyScreenState extends State<EmergencyScreen>
 
         // ── Live status card (active search) ─────────────────────────────
         if (_isSearching) _buildLiveStatusCard(center),
+
+        // ── My Location FAB ───────────────────────────────────────────────
+        Positioned(
+          right: 16,
+          bottom: 24,
+          child: MyLocationFab(
+            mapController: _mapController,
+            mapReady: _mapReady,
+            onLocationUpdated: (loc) => setState(() => _deviceLocation = loc),
+            onLocationResolved: (msg) {
+              if (msg != null && msg.isNotEmpty) {
+                setState(() => _gpsError = msg);
+              }
+            },
+          ),
+        ),
       ],
     );
   }
@@ -746,6 +1013,27 @@ class _EmergencyScreenState extends State<EmergencyScreen>
                   ),
                 ],
               ),
+              if (_compatibilitySearchLabel.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(Icons.bloodtype_outlined,
+                        size: 14, color: Colors.red[700]),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        _compatibilitySearchLabel,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.grey[800],
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
               const SizedBox(height: 10),
 
               // Row 2: countdown bar
@@ -782,12 +1070,13 @@ class _EmergencyScreenState extends State<EmergencyScreen>
                   ],
                 ),
                 const SizedBox(height: 6),
-                // Mini progress bar (5-min stage)
+                // Mini progress bar (2-min stage)
                 ClipRRect(
                   borderRadius: BorderRadius.circular(3),
                   child: LinearProgressIndicator(
                     value: 1.0 -
-                        (_secondsUntilExpansion.clamp(0, 300) / 300.0),
+                        (_secondsUntilExpansion.clamp(0, _stageDurationSeconds) /
+                            _stageDurationSeconds),
                     minHeight: 4,
                     backgroundColor: Colors.grey[200],
                     color: const Color(0xFFB71C1C),
@@ -832,6 +1121,24 @@ class _EmergencyScreenState extends State<EmergencyScreen>
                   ),
                 ],
               ),
+
+              if (_foundMatchForDecision != null) ...[
+                const SizedBox(height: 12),
+                KeyedSubtree(
+                  key: _decisionSectionKey,
+                  child: MatchDecisionCard(
+                    match: _foundMatchForDecision!,
+                    token: widget.token,
+                    busy: _matchDecisionBusy,
+                    authorized: _authorizedByMatchId[
+                        _foundMatchForDecision!['match_id'] as int? ?? -1],
+                    onConnect: () =>
+                        _connectMatch(_foundMatchForDecision!),
+                    onContinueSearch: () =>
+                        _continueSearchMatch(_foundMatchForDecision!),
+                  ),
+                ),
+              ],
 
               // Stage breadcrumb
               const SizedBox(height: 6),
@@ -914,6 +1221,19 @@ class _EmergencyScreenState extends State<EmergencyScreen>
                   onPressed: _clearResults, child: const Text('Clear')),
             ],
           ),
+          if (_foundMatchForDecision != null) ...[
+            const SizedBox(height: 10),
+            MatchDecisionCard(
+              match: _foundMatchForDecision!,
+              token: widget.token,
+              busy: _matchDecisionBusy,
+              authorized: _authorizedByMatchId[
+                  _foundMatchForDecision!['match_id'] as int? ?? -1],
+              onConnect: () => _connectMatch(_foundMatchForDecision!),
+              onContinueSearch: () =>
+                  _continueSearchMatch(_foundMatchForDecision!),
+            ),
+          ],
           if (_matchedDonors.isNotEmpty) ...[
             const Divider(height: 8),
             SizedBox(
@@ -931,8 +1251,42 @@ class _EmergencyScreenState extends State<EmergencyScreen>
     );
   }
 
-  Widget _donorCard(Map<String, dynamic> d) => Container(
-        width: 140,
+  Widget _donorCard(Map<String, dynamic> d) {
+    final matchId = d['match_id'] as int?;
+    final status = d['status']?.toString() ?? 'FOUND';
+    final auth = matchId != null ? _authorizedByMatchId[matchId] : null;
+    final name =
+        d['donor_alias']?.toString() ?? d['name']?.toString() ?? 'Donor';
+    final dist = d['distance_label']?.toString() ??
+        '${d['distance_km'] ?? '—'} km';
+    final blood = d['blood_group']?.toString();
+    final phone = auth?['phone']?.toString();
+    final showPhone =
+        (status == 'ACCEPTED' || status == 'COMPLETED') && phone != null;
+
+    Color badgeBg;
+    Color badgeFg;
+    String badgeLabel;
+    switch (status) {
+      case 'ACCEPTED':
+      case 'COMPLETED':
+        badgeBg = Colors.green[100]!;
+        badgeFg = Colors.green[800]!;
+        badgeLabel = 'Connected';
+        break;
+      case 'CONTINUED_SEARCH':
+        badgeBg = Colors.blue[100]!;
+        badgeFg = Colors.blue[800]!;
+        badgeLabel = 'Backup';
+        break;
+      default:
+        badgeBg = Colors.orange[100]!;
+        badgeFg = Colors.orange[800]!;
+        badgeLabel = 'Awaiting';
+    }
+
+    return Container(
+        width: 148,
         padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
           color: Colors.blue[50],
@@ -947,29 +1301,36 @@ class _EmergencyScreenState extends State<EmergencyScreen>
               Icon(Icons.bloodtype, size: 13, color: Colors.red[700]),
               const SizedBox(width: 4),
               Expanded(
-                child: Text(d['name']?.toString() ?? 'Donor',
+                child: Text(name,
                     style: const TextStyle(
                         fontWeight: FontWeight.bold, fontSize: 12),
                     overflow: TextOverflow.ellipsis),
               ),
             ]),
+            if (blood != null) ...[
+              const SizedBox(height: 2),
+              Text(blood, style: const TextStyle(fontSize: 11)),
+            ],
             const SizedBox(height: 3),
-            Text('📍 ${d['distance_km']} km',
-                style: const TextStyle(fontSize: 11)),
-            Text('📞 ${d['phone'] ?? '—'}',
-                style: const TextStyle(fontSize: 11),
-                overflow: TextOverflow.ellipsis),
+            Text('📍 $dist', style: const TextStyle(fontSize: 11)),
+            if (showPhone)
+              Text('📞 $phone',
+                  style: const TextStyle(fontSize: 11),
+                  overflow: TextOverflow.ellipsis)
+            else
+              Text('🔒 Contact locked',
+                  style: TextStyle(fontSize: 10, color: Colors.grey[600])),
             const Spacer(),
             Container(
               padding:
                   const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
               decoration: BoxDecoration(
-                  color: Colors.green[100],
-                  borderRadius: BorderRadius.circular(4)),
-              child: const Text('Alerted',
-                  style: TextStyle(fontSize: 10, color: Colors.green)),
+                  color: badgeBg, borderRadius: BorderRadius.circular(4)),
+              child: Text(badgeLabel,
+                  style: TextStyle(fontSize: 10, color: badgeFg)),
             ),
           ],
         ),
       );
+  }
 }

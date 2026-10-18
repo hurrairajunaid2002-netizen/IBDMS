@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'api_config.dart';
+import 'services/live_match_sync.dart';
+import 'widgets/match_found_overlay.dart';
 
 /// Active Alerts feed — open to ALL authenticated users.
 ///
@@ -19,19 +21,22 @@ class ActiveAlertsScreen extends StatefulWidget {
   final String token;
   final String userName;
   final String role;
+  final bool embedInShell;
 
   const ActiveAlertsScreen({
     super.key,
     required this.token,
     required this.userName,
     required this.role,
+    this.embedInShell = false,
   });
 
   @override
   State<ActiveAlertsScreen> createState() => _ActiveAlertsScreenState();
 }
 
-class _ActiveAlertsScreenState extends State<ActiveAlertsScreen> {
+class _ActiveAlertsScreenState extends State<ActiveAlertsScreen>
+    with WidgetsBindingObserver {
   // ── Donor profile state ───────────────────────────────────────────────────
   bool _profileChecked = false;
   bool _hasDonorProfile = false;
@@ -52,6 +57,7 @@ class _ActiveAlertsScreenState extends State<ActiveAlertsScreen> {
   List<Map<String, dynamic>> _alerts = [];
   Position? _position;
   Timer? _refreshTimer;
+  final LiveMatchSync _liveSync = LiveMatchSync();
 
   // ── Enrolment form controllers ─────────────────────────────────────────────
   final _bloodGroups = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
@@ -62,12 +68,23 @@ class _ActiveAlertsScreenState extends State<ActiveAlertsScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) => _bootstrap());
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _hasDonorProfile && _available) {
+      _pollAlertFeed();
+      _loadAlerts();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _refreshTimer?.cancel();
+    _liveSync.stopPolling();
     _weightCtrl.dispose();
     _dobCtrl.dispose();
     super.dispose();
@@ -75,9 +92,93 @@ class _ActiveAlertsScreenState extends State<ActiveAlertsScreen> {
 
   Future<void> _bootstrap() async {
     await Future.wait([_getPosition(), _checkDonorProfile(), _checkCooldown()]);
+    await _syncDonorLocation();
     await _loadAlerts();
+    _startLiveFeedPolling();
     _refreshTimer = Timer.periodic(
-        const Duration(seconds: 30), (_) => _loadAlerts());
+        const Duration(seconds: 15), (_) async {
+      await _getPosition();
+      await _syncDonorLocation();
+      await _loadAlerts();
+    });
+  }
+
+  void _startLiveFeedPolling() {
+    if (!_hasDonorProfile || !_available || _inCooldown) return;
+    _liveSync.startPolling(
+      isActive: () =>
+          mounted && _hasDonorProfile && _available && !_inCooldown,
+      pollOnce: _pollAlertFeed,
+    );
+  }
+
+  Future<void> _pollAlertFeed() async {
+    if (!_hasDonorProfile || !_available || !mounted) return;
+    try {
+      final seen = _liveSync.seenAlertIds.join(',');
+      final uri = Uri.parse(
+        '${ApiConfig.baseUrl}/api/alerts/feed'
+        '${seen.isNotEmpty ? '?seen_alert_ids=$seen' : ''}',
+      );
+      final res = await http.get(uri, headers: {
+        'Authorization': 'Bearer ${widget.token.trim()}',
+      }).timeout(const Duration(seconds: 10));
+      if (!mounted || res.statusCode != 200) return;
+
+      final data = json.decode(res.body) as Map<String, dynamic>;
+      final alerts = (data['alerts'] as List? ?? [])
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      final newAlerts = (data['new_alerts'] as List? ?? [])
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+
+      if (newAlerts.isNotEmpty && mounted) {
+        for (final alert in newAlerts) {
+          final alertId = alert['alert_id']?.toString();
+          if (alertId != null) _liveSync.markAlertSeen(alertId);
+          await MatchFoundOverlay.notifyUser();
+          if (!mounted) return;
+          await showDialog<void>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: Text(alert['title']?.toString() ?? 'Urgent request nearby'),
+              content: Text(alert['message']?.toString() ?? ''),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('View in list'),
+                ),
+              ],
+            ),
+          );
+        }
+        await _loadAlerts();
+      }
+    } catch (_) {}
+  }
+
+  /// Push live GPS to donor_profiles — matching reads DB coords, not phone cache.
+  Future<void> _syncDonorLocation() async {
+    if (!_hasDonorProfile || !_available) return;
+    final lat = _position?.latitude;
+    final lon = _position?.longitude;
+    if (lat == null || lon == null) return;
+    try {
+      await http
+          .put(
+            Uri.parse('${ApiConfig.baseUrl}/api/donor/location'),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ${widget.token}',
+            },
+            body: json.encode({
+              'gps_latitude': lat,
+              'gps_longitude': lon,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
+    } catch (_) {}
   }
 
   // ── GPS (passive — no requestPermission) ─────────────────────────────────
@@ -134,6 +235,7 @@ class _ActiveAlertsScreenState extends State<ActiveAlertsScreen> {
             _available = dp['availability_status'] == 'Active';
           }
         });
+        _startLiveFeedPolling();
       } else {
         setState(() => _profileChecked = true);
       }
@@ -170,8 +272,12 @@ class _ActiveAlertsScreenState extends State<ActiveAlertsScreen> {
       if (res.statusCode == 201) {
         Navigator.pop(context);
         setState(() { _hasDonorProfile = true; _available = true; });
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('You are now enrolled as a donor volunteer!')));
+        await _syncDonorLocation();
+        _startLiveFeedPolling();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text('You are now enrolled as a donor volunteer!')));
+        }
       } else {
         final err = json.decode(res.body);
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -361,6 +467,12 @@ class _ActiveAlertsScreenState extends State<ActiveAlertsScreen> {
           .timeout(const Duration(seconds: 10));
       if (mounted && res.statusCode == 200) {
         setState(() => _available = val);
+        if (val) {
+          await _syncDonorLocation();
+          _startLiveFeedPolling();
+        } else {
+          _liveSync.stopPolling();
+        }
       }
     } catch (_) {
       if (mounted) setState(() => _available = val);
@@ -483,35 +595,38 @@ class _ActiveAlertsScreenState extends State<ActiveAlertsScreen> {
     // Show cooldown screen when user is enrolled and in cooling-off period.
     if (_profileChecked && _hasDonorProfile && _inCooldown) {
       return Scaffold(
-        appBar: AppBar(title: const Text('Donor Status')),
+        appBar: widget.embedInShell ? null : AppBar(title: const Text('Donor Status')),
         body: _buildCooldownScreen(),
       );
     }
 
     return Scaffold(
       backgroundColor: Colors.grey[50],
-      appBar: AppBar(
-        title: const Text('Active Emergency Alerts'),
-        actions: [
-          if (_hasDonorProfile)
-            Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: _togglingAvailability
-                  ? const SizedBox(
-                      width: 18, height: 18,
-                      child: CircularProgressIndicator(
-                          strokeWidth: 2, color: Colors.white))
-                  : Switch(
-                      value: _available,
-                      activeThumbColor: Colors.white,
-                      activeTrackColor: Colors.green[400],
-                      inactiveThumbColor: Colors.grey[300],
-                      inactiveTrackColor: Colors.grey[600],
-                      onChanged: _toggleAvailability,
-                    ),
+      appBar: widget.embedInShell
+          ? null
+          : AppBar(
+              title: const Text('Active Emergency Alerts'),
+              actions: [
+                if (_hasDonorProfile)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: _togglingAvailability
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 2, color: Colors.white))
+                        : Switch(
+                            value: _available,
+                            activeThumbColor: Colors.white,
+                            activeTrackColor: Colors.green[400],
+                            inactiveThumbColor: Colors.grey[300],
+                            inactiveTrackColor: Colors.grey[600],
+                            onChanged: _toggleAvailability,
+                          ),
+                  ),
+              ],
             ),
-        ],
-      ),
       body: Column(
         children: [
           // ── Volunteer enrolment banner (non-donors) ─────────────────────

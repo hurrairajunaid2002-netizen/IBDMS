@@ -1,23 +1,6 @@
 """
-Time-Staged Radius Escalation Engine
-=====================================
-Runs as a background daemon thread (started by main.py on_startup).
-
-Algorithm
----------
-Every POLL_INTERVAL_SECONDS the worker queries all 'Pending' blood requests.
-For each request whose search_updated_at is at least STAGE_DURATION_SECONDS
-old, the engine:
-
-  1. Increments current_radius_km by STEP_KM (up to MAX_RADIUS_KM).
-  2. Re-runs the Haversine matching pipeline at the new radius.
-  3. If matched_count >= units_required  →  marks the request 'Fulfilled'.
-  4. If new radius == MAX_RADIUS_KM and still no match after the stage
-     wait  →  marks the request 'Unfulfilled' (Admin Notified).
-
-Early-exit conditions (handled via /cancel endpoint in blood_routes.py):
-  - Recipient calls POST /api/requests/{id}/cancel → status set to 'Cancelled'.
-    The worker skips non-Pending requests, so escalation stops immediately.
+Time-Staged Radius Escalation Engine  (5 → 10 → 15 … → 50 km)
+==============================================================
 """
 
 import threading
@@ -26,20 +9,23 @@ from datetime import datetime
 
 from config.database import SessionLocal
 from models.request import BloodRequest
-from controllers.matching_engine import process_matching_pipeline
+from controllers.matching_service import (
+    INITIAL_RADIUS_KM,
+    MAX_RADIUS_KM,
+    STEP_KM,
+    count_accepted_matches,
+    next_radius_tier,
+    push_found_ws_events,
+    search_donors_at_radius,
+    sync_match_records,
+)
+from controllers.notification_tasks import notify_match_found_worker
 
-# ── Tuneable constants ────────────────────────────────────────────────────────
-POLL_INTERVAL_SECONDS: int = 30      # Worker wake-up frequency
-STAGE_DURATION_SECONDS: int = 300    # 5 minutes per radius tier
-INITIAL_RADIUS_KM: float = 5.0
-STEP_KM: float = 5.0
-MAX_RADIUS_KM: float = 50.0
+POLL_INTERVAL_SECONDS: int = 30
+STAGE_DURATION_SECONDS: int = 120
 
-
-# ── Worker implementation ─────────────────────────────────────────────────────
 
 def _run_escalation_cycle() -> None:
-    """Single escalation pass — opens its own DB session, closes it when done."""
     db = SessionLocal()
     try:
         now = datetime.utcnow()
@@ -50,7 +36,6 @@ def _run_escalation_cycle() -> None:
         )
 
         for req in pending:
-            # Initialise search_updated_at if somehow missing.
             if req.search_updated_at is None:
                 req.search_updated_at = now
                 db.commit()
@@ -58,82 +43,61 @@ def _run_escalation_cycle() -> None:
 
             elapsed = (now - req.search_updated_at).total_seconds()
             if elapsed < STAGE_DURATION_SECONDS:
-                continue  # Stage timer not yet expired.
+                continue
 
             current_r = float(req.current_radius_km or INITIAL_RADIUS_KM)
 
-            # ── Hard ceiling: mark Unfulfilled and stop ────────────────────
             if current_r >= MAX_RADIUS_KM:
-                req.status = "Unfulfilled"
-                req.closed_at = now
+                accepted = count_accepted_matches(db, req.request_id)
+                if accepted >= req.units_required:
+                    req.status = "Fulfilled"
+                    req.closed_at = now
+                else:
+                    req.status = "Unfulfilled"
+                    req.closed_at = now
                 db.commit()
                 print(
-                    f"INFO:  [Escalation] Request {req.request_id} → Unfulfilled "
-                    f"(exhausted {MAX_RADIUS_KM} km ceiling)"
+                    f"INFO:  [Escalation] Request {req.request_id} → {req.status} "
+                    f"(ceiling {MAX_RADIUS_KM} km)"
                 )
                 continue
 
-            # ── Increment radius and re-match ──────────────────────────────
-            new_r = min(current_r + STEP_KM, MAX_RADIUS_KM)
-            matched = process_matching_pipeline(
+            new_r = next_radius_tier(current_r)
+
+            matched = search_donors_at_radius(
                 db,
                 float(req.request_latitude),
                 float(req.request_longitude),
                 req.blood_group_needed,
                 new_r,
+                exclude_user_ids=[req.recipient_user_id],
+                searcher_user_id=req.recipient_user_id,
             )
 
+            _, newly_found = sync_match_records(db, req.request_id, matched)
             req.current_radius_km = new_r
             req.matched_count = len(matched)
-            req.search_updated_at = now  # Reset stage timer.
+            req.search_updated_at = now
 
-            if len(matched) >= req.units_required:
+            if newly_found:
+                donor_lookup = {d["user_id"]: d for d in matched if d.get("user_id")}
+                notify_match_found_worker(db, req, newly_found, donor_lookup)
+                push_found_ws_events(db, req, newly_found, donor_lookup)
+
+            accepted = count_accepted_matches(db, req.request_id)
+            if accepted >= req.units_required:
                 req.status = "Fulfilled"
                 req.closed_at = now
                 print(
                     f"INFO:  [Escalation] Request {req.request_id} → Fulfilled "
-                    f"at {new_r} km ({len(matched)} donor(s))"
+                    f"({accepted} accepted donor(s))"
                 )
             else:
                 print(
                     f"INFO:  [Escalation] Request {req.request_id} → "
-                    f"radius escalated to {new_r} km ({len(matched)} donor(s) found)"
+                    f"radius {new_r} km ({len(matched)} discovered, "
+                    f"{accepted} accepted)"
                 )
-
-            if matched and req.status == "Pending":
-                from controllers.notification_controller import (
-                    broadcast_blood_request_push,
-                    send_blood_request_alert,
-                )
-
-                location_hint = (
-                    f"Lat {round(float(req.request_latitude), 3)}, "
-                    f"Lon {round(float(req.request_longitude), 3)}"
-                )
-                fcm_tokens = [d["fcm_token"] for d in matched if d.get("fcm_token")]
-                donor_emails = [d["email"] for d in matched if d.get("email")]
-
-                threading.Thread(
-                    target=broadcast_blood_request_push,
-                    args=(
-                        fcm_tokens,
-                        req.blood_group_needed,
-                        location_hint,
-                        req.request_id,
-                    ),
-                    daemon=True,
-                ).start()
-                threading.Thread(
-                    target=send_blood_request_alert,
-                    args=(
-                        donor_emails,
-                        "IBDMS Patient",
-                        req.blood_group_needed,
-                        location_hint,
-                        req.request_id,
-                    ),
-                    daemon=True,
-                ).start()
 
             db.commit()
 
@@ -144,14 +108,17 @@ def _run_escalation_cycle() -> None:
 
 
 def _escalation_loop() -> None:
-    print("INFO:     Radius escalation worker started (5 min stages, max 50 km).")
+    print(
+        f"INFO:     Radius escalation worker started "
+        f"({INITIAL_RADIUS_KM} km → {MAX_RADIUS_KM} km in +{STEP_KM} km / "
+        f"{STAGE_DURATION_SECONDS}s stages)."
+    )
     while True:
         _run_escalation_cycle()
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
 def start_escalation_worker() -> None:
-    """Spawn the daemon thread.  Call once from main.py on_startup."""
     t = threading.Thread(
         target=_escalation_loop,
         daemon=True,

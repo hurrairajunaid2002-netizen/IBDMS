@@ -3,6 +3,7 @@ import 'emergency_screen.dart';
 import 'chatbot_screen.dart';
 import 'active_alerts_screen.dart';
 import 'user_profile_screen.dart';
+import 'widgets/role_selection_gate.dart';
 
 /// Central 4-tab navigation shell.
 ///
@@ -20,6 +21,7 @@ class HomeHub extends StatefulWidget {
   final String role;
   final String userName;
   final int initialTab;
+  final bool needsRoleSelection;
 
   const HomeHub({
     super.key,
@@ -27,6 +29,7 @@ class HomeHub extends StatefulWidget {
     required this.role,
     required this.userName,
     this.initialTab = 0,
+    this.needsRoleSelection = false,
   });
 
   @override
@@ -35,6 +38,9 @@ class HomeHub extends StatefulWidget {
 
 class _HomeHubState extends State<HomeHub> {
   late int _currentIndex;
+  late String _token;
+  late String _role;
+  late bool _needsRoleSelection;
 
   // Active mode drives which tab is highlighted by default and which
   // tab the mode-toggle snaps to.
@@ -47,12 +53,26 @@ class _HomeHubState extends State<HomeHub> {
   @override
   void initState() {
     super.initState();
-    // Donors land on the alerts tab; everyone else on the search tab.
-    _donorMode = widget.role == 'Donor';
+    _token = widget.token;
+    _role = widget.role;
+    _needsRoleSelection =
+        widget.needsRoleSelection || _role == 'Unassigned';
+    _donorMode = _role == 'Donor';
     _currentIndex = widget.initialTab != 0
         ? widget.initialTab
         : (_donorMode ? 2 : 0);
     _visitedTabs.add(_currentIndex);
+  }
+
+  void _onRoleSelected(RoleSelectionResult result) {
+    setState(() {
+      _token = result.token;
+      _role = result.role;
+      _needsRoleSelection = false;
+      _donorMode = result.role == 'Donor';
+      _currentIndex = _donorMode ? 2 : 0;
+      _visitedTabs.add(_currentIndex);
+    });
   }
 
   Widget _tabAt(int index) {
@@ -62,22 +82,22 @@ class _HomeHubState extends State<HomeHub> {
     switch (index) {
       case 0:
         return EmergencyScreen(
-          token: widget.token,
+          token: _token,
           userName: widget.userName,
-          role: widget.role,
+          role: _role,
         );
       case 1:
-        return ChatbotScreen(token: widget.token);
+        return ChatbotScreen(token: _token);
       case 2:
         return ActiveAlertsScreen(
-          token: widget.token,
+          token: _token,
           userName: widget.userName,
-          role: widget.role,
+          role: _role,
         );
       case 3:
         return UserProfileScreen(
-          token: widget.token,
-          role: widget.role,
+          token: _token,
+          role: _role,
           userName: widget.userName,
         );
       default:
@@ -108,16 +128,30 @@ class _HomeHubState extends State<HomeHub> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: _buildAppBar(),
-      body: IndexedStack(
-        index: _currentIndex,
+      body: Stack(
+        fit: StackFit.expand,
         children: [
-          _tabAt(0),
-          _tabAt(1),
-          _tabAt(2),
-          _tabAt(3),
+          AbsorbPointer(
+            absorbing: _needsRoleSelection,
+            child: IndexedStack(
+              index: _currentIndex,
+              children: [
+                _tabAt(0),
+                _tabAt(1),
+                _tabAt(2),
+                _tabAt(3),
+              ],
+            ),
+          ),
+          if (_needsRoleSelection)
+            RoleSelectionGate(
+              token: _token,
+              userName: widget.userName,
+              onComplete: _onRoleSelected,
+            ),
         ],
       ),
-      bottomNavigationBar: _buildBottomNav(),
+      bottomNavigationBar: _needsRoleSelection ? null : _buildBottomNav(),
     );
   }
 

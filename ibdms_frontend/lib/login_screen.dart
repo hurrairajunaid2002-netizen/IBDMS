@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart'; // REQUIRED for kIsWeb flag
 import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
@@ -7,8 +8,10 @@ import 'signup_screen.dart';
 import 'forgot_password_screen.dart';
 import 'complete_profile_screen.dart';
 import 'home_hub.dart';
+import 'admin_dashboard_screen.dart';
+import 'widgets/admin_gateway_sheet.dart';
 
-/// Login screen — v3.0
+/// Login screen — v3.1 (Web Fixed)
 /// Supports: email/password login, Google Sign-In, Forgot Password.
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -28,15 +31,21 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _rescanning = false;
   String? _errorMessage;
 
-  // The Web OAuth 2.0 client ID from Firebase Console.
-  // Required so that auth.idToken is populated after sign-in.
+  // Web OAuth client ID (used as clientId on web, forbidden as serverClientId on web).
   static const _webClientId =
+      '162061946822-5bapdpta1k3kjt240ub1pi9rugtm9pte.apps.googleusercontent.com';
+
+  // Android server client ID — the Web client registered in Firebase/google-services.json.
+  // Used only on native Android to request an ID token for backend verification.
+  // google_sign_in_web asserts serverClientId == null, so it must be null on web.
+  static const _androidServerClientId =
       '162061946822-kuokvhgaomuve1g0epevt8vshgvn8goi.apps.googleusercontent.com';
 
-  // Reuse one plugin instance — creating a new one per tap can crash on Android.
   static final GoogleSignIn _googleSignInClient = GoogleSignIn(
-    scopes: ['email', 'profile'],
-    serverClientId: _webClientId,
+    clientId: kIsWeb ? _webClientId : null,
+    // openid is required for the OIDC id_token to be included in the response.
+    scopes: ['openid', 'email', 'profile'],
+    serverClientId: kIsWeb ? null : _androidServerClientId,
   );
 
   // RFC 5322-like email regex — same as backend.
@@ -61,9 +70,11 @@ class _LoginScreenState extends State<LoginScreen> {
       return;
     }
     final token = rawToken.trim();
-    final role = data['role'] as String? ?? 'Donor';
+    final role = data['role'] as String? ?? 'Unassigned';
     final name = data['full_name'] as String? ?? _emailCtrl.text;
     final needsProfile = data['needs_profile'] as bool? ?? false;
+    final needsRoleSelection =
+        data['needs_role_selection'] as bool? ?? role == 'Unassigned';
 
     if (needsProfile) {
       Navigator.of(context).pushReplacement(
@@ -74,9 +85,23 @@ class _LoginScreenState extends State<LoginScreen> {
       return;
     }
 
+    if (role == 'Administrator') {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => AdminDashboardScreen(token: token, adminName: name),
+        ),
+      );
+      return;
+    }
+
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
-        builder: (_) => HomeHub(token: token, role: role, userName: name),
+        builder: (_) => HomeHub(
+          token: token,
+          role: role,
+          userName: name,
+          needsRoleSelection: needsRoleSelection,
+        ),
       ),
     );
   }
@@ -137,23 +162,34 @@ class _LoginScreenState extends State<LoginScreen> {
 
       final auth = await account.authentication;
       final idToken = auth.idToken;
+      final accessToken = auth.accessToken;
 
-      if (idToken == null) {
+      // On web, google_sign_in_web token-client flow may not return an id_token
+      // even with openid scope. Fall back to access_token + userinfo endpoint.
+      if (idToken == null && accessToken == null) {
         setState(() {
           _googleLoading = false;
           _errorMessage =
-              'Google Sign-In: could not retrieve ID token.\n'
+              'Google Sign-In: could not retrieve token.\n'
               'Ensure the SHA-1 fingerprint is registered in Firebase Console '
               'and google-services.json is up to date.';
         });
         return;
       }
 
+      // Choose the right backend endpoint based on which token is available.
+      final endpoint = idToken != null
+          ? '${ApiConfig.baseUrl}/api/auth/google'
+          : '${ApiConfig.baseUrl}/api/auth/google-web';
+      final body = idToken != null
+          ? json.encode({'id_token': idToken})
+          : json.encode({'access_token': accessToken});
+
       final res = await http
           .post(
-            Uri.parse('${ApiConfig.baseUrl}/api/auth/google'),
+            Uri.parse(endpoint),
             headers: {'Content-Type': 'application/json'},
-            body: json.encode({'id_token': idToken}),
+            body: body,
           )
           .timeout(const Duration(seconds: 15));
 
@@ -179,7 +215,6 @@ class _LoginScreenState extends State<LoginScreen> {
     } catch (e) {
       if (!mounted) return;
       final msg = e.toString();
-      // ApiException: 10 = DEVELOPER_ERROR (SHA-1 not registered in Firebase).
       if (msg.contains('ApiException: 10') || msg.contains('sign_in_failed')) {
         setState(() => _errorMessage =
             'Google Sign-In setup error (code 10).\n\n'
@@ -434,7 +469,18 @@ class _LoginScreenState extends State<LoginScreen> {
                                     style: TextStyle(fontSize: 16)),
                           ),
 
-                          const SizedBox(height: 16),
+                          const SizedBox(height: 12),
+                          TextButton.icon(
+                            onPressed: () => AdminGatewaySheet.show(context),
+                            icon: Icon(Icons.admin_panel_settings_outlined,
+                                size: 16, color: Colors.grey[600]),
+                            label: Text(
+                              'Administrator access',
+                              style: TextStyle(
+                                  fontSize: 12, color: Colors.grey[600]),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
 
                           // ── Divider ──────────────────────────────────────
                           Row(children: [
@@ -468,13 +514,7 @@ class _LoginScreenState extends State<LoginScreen> {
                                     height: 18,
                                     child: CircularProgressIndicator(
                                         strokeWidth: 2))
-                                : Image.network(
-                                    'https://lh3.googleusercontent.com/COxitqgJr1sJnIDe8-jiKhxDx1FrYbtRHKJ9z_hELisAlapwE9LUYhen8K1NAEpFPnKquTVjyoKmNkpVJO6sGbwSVLLJV0',
-                                    height: 20,
-                                    errorBuilder: (ctx, err, st) => const Icon(
-                                        Icons.login,
-                                        size: 20),
-                                  ),
+                                : const Icon(Icons.g_mobiledata, size: 24, color: Colors.red),
                             label: Text(
                               _googleLoading
                                   ? 'Signing in…'
@@ -502,6 +542,8 @@ class _LoginScreenState extends State<LoginScreen> {
                               builder: (_) => const SignupScreen())),
                       child: const Text('Registration'),
                     ),
+                    // UDP network scan only works on mobile (not on web).
+                    if (!kIsWeb) ...[
                     Text('·', style: TextStyle(color: Colors.grey[400])),
                     TextButton.icon(
                       onPressed: _rescanning ? null : _rescan,
@@ -517,6 +559,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       style: TextButton.styleFrom(
                           foregroundColor: const Color(0xFFB71C1C)),
                     ),
+                    ], // end if (!kIsWeb)
                   ],
                 ),
               ],
@@ -531,9 +574,10 @@ class _LoginScreenState extends State<LoginScreen> {
     return ValueListenableBuilder<String>(
       valueListenable: ApiConfig.serverIpNotifier,
       builder: (context, ip, child) {
-        final isDiscovering = ApiConfig.isDiscovering;
+        // On web, server is always localhost — no discovery, no manual IP needed.
+        final isDiscovering = kIsWeb ? false : ApiConfig.isDiscovering;
         return GestureDetector(
-          onTap: _showManualIpSheet,
+          onTap: kIsWeb ? null : _showManualIpSheet,
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 300),
             padding:
@@ -560,9 +604,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   Icon(Icons.circle, size: 8, color: Colors.green[600]),
                 const SizedBox(width: 6),
                 Text(
-                  isDiscovering
-                      ? 'Discovering server…'
-                      : 'http://$ip:5000',
+                  ApiConfig.baseUrl,
                   style: TextStyle(
                     fontSize: 11,
                     color: isDiscovering
@@ -570,8 +612,10 @@ class _LoginScreenState extends State<LoginScreen> {
                         : Colors.grey[600],
                   ),
                 ),
-                const SizedBox(width: 4),
-                Icon(Icons.edit_outlined, size: 11, color: Colors.grey[400]),
+                if (!kIsWeb) ...[
+                  const SizedBox(width: 4),
+                  Icon(Icons.edit_outlined, size: 11, color: Colors.grey[400]),
+                ],
               ],
             ),
           ),

@@ -23,8 +23,9 @@ from schemas.auth_schema import (
     ResetPasswordSchema,
 )
 
-SECRET_KEY = os.getenv("JWT_SECRET", "SUPER_SECRET_COMP_SCI_KEY")
+from config.settings import GOOGLE_CLIENT_ID, JWT_SECRET
 ALGORITHM = "HS256"
+SECRET_KEY = JWT_SECRET
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # ── In-memory OTP store (sufficient for FYP; replace with DB table in prod) ──
@@ -51,6 +52,7 @@ def _token_response(user: User, needs_profile: bool = False) -> dict:
         "full_name": user.full_name,
         "blood_group": user.blood_group,
         "needs_profile": needs_profile,
+        "needs_role_selection": user.role == "Unassigned",
     }
 
 
@@ -80,10 +82,9 @@ def _upsert_donor_profile(db: Session, user: User) -> None:
 
 def register_new_user(db: Session, data: UserRegisterSchema) -> User:
     """
-    Universal registration — no role selector.  All users receive role='Donor'
-    so they can switch between requesting and donating immediately.
-    A DonorProfile is created with Inactive availability; the user opts-in
-    when they choose "Want to Donate" and satisfy the eligibility check.
+    Universal registration — no role selector.  New accounts start as
+    role='Unassigned' until the user explicitly chooses Donor or Recipient
+    during onboarding.
     """
     existing = db.query(User).filter(User.email == data.email).first()
     if existing:
@@ -94,7 +95,7 @@ def register_new_user(db: Session, data: UserRegisterSchema) -> User:
         full_name=data.full_name,
         email=data.email,
         password_hash=hashed_pwd,
-        role="Donor",          # Universal role for all public registrations.
+        role="Unassigned",
         phone_number=data.phone_number,
         blood_group=data.blood_group,
     )
@@ -151,7 +152,7 @@ def google_signin(db: Session, id_token_str: str) -> dict:
         from google.oauth2 import id_token as google_id_token
         from google.auth.transport import requests as google_requests
 
-        client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+        client_id = GOOGLE_CLIENT_ID
         if not client_id:
             raise ValueError(
                 "GOOGLE_CLIENT_ID environment variable is not configured. "
@@ -185,7 +186,7 @@ def google_signin(db: Session, id_token_str: str) -> dict:
             full_name=full_name,
             email=email,
             password_hash=None,
-            role="Donor",
+            role="Unassigned",
             phone_number="",
             blood_group=None,
             google_id=google_id,
@@ -195,6 +196,62 @@ def google_signin(db: Session, id_token_str: str) -> dict:
         db.refresh(user)
     else:
         # Link google_id if the account was created via email/password.
+        if not user.google_id:
+            user.google_id = google_id
+            db.commit()
+
+    needs_profile = not user.phone_number or not user.blood_group
+    return _token_response(user, needs_profile=needs_profile)
+
+
+# ── Google Sign-In (Web / access-token fallback) ─────────────────────────────
+
+def google_signin_web(db: Session, access_token_str: str) -> dict:
+    """
+    Web fallback: verify a Google OAuth2 access_token by calling Google's
+    userinfo endpoint (https://www.googleapis.com/oauth2/v3/userinfo).
+    Used when google_sign_in_web token-client flow returns no id_token.
+    """
+    import urllib.request
+    import json as json_lib
+
+    req = urllib.request.Request(
+        "https://www.googleapis.com/oauth2/v3/userinfo",
+        headers={"Authorization": f"Bearer {access_token_str}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            idinfo = json_lib.loads(resp.read().decode())
+    except Exception as exc:
+        raise ValueError(f"Could not verify Google access token: {exc}")
+
+    google_id = idinfo.get("sub")
+    email = idinfo.get("email", "").lower().strip()
+    full_name = idinfo.get("name", email.split("@")[0])
+
+    if not google_id or not email:
+        raise ValueError("Google userinfo response missing required fields.")
+
+    user = (
+        db.query(User)
+        .filter((User.google_id == google_id) | (User.email == email))
+        .first()
+    )
+
+    if user is None:
+        user = User(
+            full_name=full_name,
+            email=email,
+            password_hash=None,
+            role="Unassigned",
+            phone_number="",
+            blood_group=None,
+            google_id=google_id,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    else:
         if not user.google_id:
             user.google_id = google_id
             db.commit()
@@ -214,6 +271,25 @@ def complete_profile(db: Session, user_id: int, data: CompleteProfileSchema) -> 
     user.phone_number = data.phone_number
     user.blood_group = data.blood_group
     _upsert_donor_profile(db, user)
+    db.commit()
+    db.refresh(user)
+    return _token_response(user, needs_profile=False)
+
+
+# ── Role Selection (onboarding) ───────────────────────────────────────────────
+
+def select_role(db: Session, user_id: int, role: str) -> dict:
+    """Persist the user's explicit Donor vs Recipient preference."""
+    if role not in ("Donor", "Recipient"):
+        raise ValueError("Role must be Donor or Recipient.")
+
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        raise ValueError("User not found.")
+    if user.role == "Administrator":
+        raise ValueError("Administrator accounts cannot change role here.")
+
+    user.role = role
     db.commit()
     db.refresh(user)
     return _token_response(user, needs_profile=False)

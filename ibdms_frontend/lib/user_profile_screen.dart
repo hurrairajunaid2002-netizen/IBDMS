@@ -8,12 +8,14 @@ class UserProfileScreen extends StatefulWidget {
   final String token;
   final String role;
   final String userName;
+  final bool embedInShell;
 
   const UserProfileScreen({
     super.key,
     required this.token,
     required this.role,
     required this.userName,
+    this.embedInShell = false,
   });
 
   @override
@@ -80,7 +82,7 @@ class _UserProfileScreenState extends State<UserProfileScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.grey[50],
-      appBar: AppBar(title: const Text('User Profile')),
+      appBar: widget.embedInShell ? null : AppBar(title: const Text('User Profile')),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
